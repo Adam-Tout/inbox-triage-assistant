@@ -63,8 +63,8 @@ class InboxTriageAssistant:
                 
                 # Use headless flow for Railway deployment
                 flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-                # Use headless authentication
-                creds = flow.run_console()
+                # Use headless authentication with a random port
+                creds = flow.run_local_server(port=0, open_browser=False)
             
             # Save credentials for next run
             with open('token.pickle', 'wb') as token:
