@@ -61,8 +61,10 @@ class InboxTriageAssistant:
                 if not os.path.exists('credentials.json'):
                     return False
                 
+                # Use headless flow for Railway deployment
                 flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-                creds = flow.run_local_server(port=0)
+                # Use headless authentication
+                creds = flow.run_console()
             
             # Save credentials for next run
             with open('token.pickle', 'wb') as token:
@@ -261,7 +263,7 @@ def load_emails():
     try:
         # Authenticate
         if not assistant.authenticate():
-            return jsonify({'error': 'Authentication failed'}), 401
+            return jsonify({'error': 'Authentication failed. Please check your credentials.'}), 401
         
         # Fetch emails
         if not assistant.fetch_emails():
