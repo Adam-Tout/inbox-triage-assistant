@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-Inbox Triage Assistant
-Clusters emails and enables one-click archiving
+Inbox Triage Assistant - Web Version
+Flask web app for email clustering and archiving
 """
 
 import os
 import pickle
 import base64
 import re
+import json
+import logging
 from typing import List, Dict, Tuple
 from collections import defaultdict
+from datetime import datetime
 
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -21,14 +26,22 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 import numpy as np
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Gmail API scopes
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'inbox_triage_secret_key')
 
 class InboxTriageAssistant:
     def __init__(self):
         self.service = None
         self.emails = []
         self.clusters = {}
+        self.cluster_names = {}
         
     def authenticate(self):
         """Authenticate with Gmail API using service account only"""
@@ -37,29 +50,68 @@ class InboxTriageAssistant:
             service_account_info = os.environ.get('GOOGLE_SERVICE_ACCOUNT')
             
             if service_account_info:
-                print("Using service account authentication")
+                logger.info("Using service account authentication")
                 # Parse the service account JSON from environment variable
                 service_account_dict = json.loads(service_account_info)
                 creds = service_account.Credentials.from_service_account_info(
                     service_account_dict, scopes=SCOPES
                 )
-                self.service = build('gmail', 'v1', credentials=creds)
-                print("Gmail service built successfully with service account")
-                return True
             else:
-                print("No service account credentials found in GOOGLE_SERVICE_ACCOUNT environment variable")
-                print("Please set GOOGLE_SERVICE_ACCOUNT environment variable with your service account JSON")
-                return False
+                logger.info("Falling back to OAuth authentication")
+                # Fallback to OAuth flow
+                creds = None
                 
+                # Load existing token
+                if os.path.exists('token.pickle'):
+                    with open('token.pickle', 'rb') as token:
+                        creds = pickle.load(token)
+                
+                # If no valid credentials, get new ones
+                if not creds or not creds.valid:
+                    if creds and creds.expired and creds.refresh_token:
+                        logger.info("Refreshing expired credentials")
+                        creds.refresh(Request())
+                    else:
+                        logger.info("No valid credentials found, attempting to get new ones")
+                        # Try to get credentials from environment variable (Railway)
+                        google_creds = os.environ.get('GOOGLE_CREDENTIALS')
+                        if google_creds:
+                            logger.info("Found GOOGLE_CREDENTIALS in environment")
+                            # Create credentials.json from environment variable
+                            with open('credentials.json', 'w') as f:
+                                f.write(google_creds)
+                        else:
+                            logger.error("No credentials found in environment")
+                            return False
+                        
+                        if not os.path.exists('credentials.json'):
+                            logger.error("credentials.json file not found")
+                            return False
+                        
+                        # Use headless flow for Railway deployment
+                        flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+                        # Use headless authentication with a random port
+                        logger.info("Starting OAuth flow")
+                        creds = flow.run_local_server(port=0, open_browser=False)
+                        logger.info("OAuth flow completed successfully")
+                    
+                    # Save credentials for next run
+                    with open('token.pickle', 'wb') as token:
+                        pickle.dump(creds, token)
+                    logger.info("Credentials saved to token.pickle")
+            
+            self.service = build('gmail', 'v1', credentials=creds)
+            logger.info("Gmail service built successfully")
+            return True
+            
         except Exception as e:
-            print(f"Authentication failed: {str(e)}")
+            logger.error(f"Authentication failed: {str(e)}")
             return False
     
     def fetch_emails(self, max_emails=200):
         """Fetch last 200 emails from inbox"""
         try:
-            print("📧 Fetching emails...")
-            
+            logger.info(f"Fetching up to {max_emails} emails")
             # Get email IDs
             results = self.service.users().messages().list(
                 userId='me', 
@@ -69,13 +121,16 @@ class InboxTriageAssistant:
             
             messages = results.get('messages', [])
             if not messages:
-                print("No emails found in inbox")
-                return
+                logger.warning("No messages found in inbox")
+                return False
+            
+            logger.info(f"Found {len(messages)} messages, fetching details")
             
             # Fetch full email details
             self.emails = []
             for i, message in enumerate(messages):
-                print(f"Processing email {i+1}/{len(messages)}...")
+                if i % 50 == 0:  # Log progress every 50 emails
+                    logger.info(f"Processing email {i+1}/{len(messages)}")
                 
                 msg = self.service.users().messages().get(
                     userId='me', 
@@ -87,10 +142,15 @@ class InboxTriageAssistant:
                 if email_data:
                     self.emails.append(email_data)
             
-            print(f"✅ Fetched {len(self.emails)} emails")
+            logger.info(f"Successfully fetched {len(self.emails)} emails")
+            return True
             
         except HttpError as error:
-            print(f"❌ Error fetching emails: {error}")
+            logger.error(f"HTTP error while fetching emails: {error}")
+            return False
+        except Exception as error:
+            logger.error(f"Unexpected error while fetching emails: {error}")
+            return False
     
     def _parse_email(self, msg):
         """Parse email message into structured data"""
@@ -115,7 +175,7 @@ class InboxTriageAssistant:
                 'labels': msg.get('labelIds', [])
             }
         except Exception as e:
-            print(f"Error parsing email: {e}")
+            logger.error(f"Error parsing email: {e}")
             return None
     
     def _extract_body(self, payload):
@@ -134,39 +194,46 @@ class InboxTriageAssistant:
     def cluster_emails(self, num_clusters=5):
         """Cluster emails using TF-IDF and K-means"""
         if not self.emails:
-            print("No emails to cluster")
-            return
+            logger.warning("No emails to cluster")
+            return False
         
-        print("🔍 Clustering emails...")
-        
-        # Prepare text for clustering
-        texts = []
-        for email in self.emails:
-            text = f"{email['subject']} {email['sender']} {email['snippet']}"
-            texts.append(text)
-        
-        # Vectorize text
-        vectorizer = TfidfVectorizer(
-            max_features=1000,
-            stop_words='english',
-            ngram_range=(1, 2)
-        )
-        
-        X = vectorizer.fit_transform(texts)
-        
-        # Cluster
-        kmeans = KMeans(n_clusters=min(num_clusters, len(self.emails)), random_state=42)
-        clusters = kmeans.fit_predict(X)
-        
-        # Group emails by cluster
-        self.clusters = defaultdict(list)
-        for i, cluster_id in enumerate(clusters):
-            self.clusters[cluster_id].append(self.emails[i])
-        
-        # Generate cluster names
-        self.cluster_names = self._generate_cluster_names()
-        
-        print(f"✅ Created {len(self.clusters)} clusters")
+        try:
+            logger.info(f"Clustering {len(self.emails)} emails into {num_clusters} clusters")
+            
+            # Prepare text for clustering
+            texts = []
+            for email in self.emails:
+                text = f"{email['subject']} {email['sender']} {email['snippet']}"
+                texts.append(text)
+            
+            # Vectorize text
+            vectorizer = TfidfVectorizer(
+                max_features=1000,
+                stop_words='english',
+                ngram_range=(1, 2)
+            )
+            
+            X = vectorizer.fit_transform(texts)
+            logger.info(f"Text vectorization completed, shape: {X.shape}")
+            
+            # Cluster
+            kmeans = KMeans(n_clusters=min(num_clusters, len(self.emails)), random_state=42)
+            clusters = kmeans.fit_predict(X)
+            
+            # Group emails by cluster
+            self.clusters = defaultdict(list)
+            for i, cluster_id in enumerate(clusters):
+                self.clusters[cluster_id].append(self.emails[i])
+            
+            # Generate cluster names
+            self.cluster_names = self._generate_cluster_names()
+            
+            logger.info(f"Clustering completed, created {len(self.clusters)} clusters")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error during clustering: {e}")
+            return False
     
     def _generate_cluster_names(self):
         """Generate descriptive names for clusters"""
@@ -192,7 +259,7 @@ class InboxTriageAssistant:
             # Find most common word
             if word_count:
                 most_common = max(word_count.items(), key=lambda x: x[1])[0]
-                names[cluster_id] = f"📧 {most_common.title()} ({len(emails)} emails)"
+                names[cluster_id] = f"{most_common.title()} ({len(emails)} emails)"
             else:
                 # Fallback to sender domain
                 domains = []
@@ -202,43 +269,21 @@ class InboxTriageAssistant:
                 
                 if domains:
                     most_common_domain = max(set(domains), key=domains.count)
-                    names[cluster_id] = f"📧 {most_common_domain} ({len(emails)} emails)"
+                    names[cluster_id] = f"{most_common_domain} ({len(emails)} emails)"
                 else:
-                    names[cluster_id] = f"📧 Cluster {cluster_id + 1} ({len(emails)} emails)"
+                    names[cluster_id] = f"Cluster {cluster_id + 1} ({len(emails)} emails)"
         
         return names
-    
-    def display_clusters(self):
-        """Display clusters with options"""
-        print("\n" + "="*60)
-        print("📬 INBOX TRIAGE ASSISTANT")
-        print("="*60)
-        
-        for cluster_id, emails in self.clusters.items():
-            cluster_name = self.cluster_names[cluster_id]
-            print(f"\n{cluster_name}")
-            print("-" * 40)
-            
-            # Show first 3 emails as examples
-            for i, email in enumerate(emails[:3]):
-                print(f"  {i+1}. {email['subject'][:50]}...")
-                print(f"     From: {email['sender']}")
-            
-            if len(emails) > 3:
-                print(f"  ... and {len(emails) - 3} more emails")
-        
-        print("\n" + "="*60)
     
     def archive_cluster(self, cluster_id):
         """Archive all emails in a cluster"""
         if cluster_id not in self.clusters:
-            print("❌ Invalid cluster ID")
-            return
+            return False
         
         emails = self.clusters[cluster_id]
-        print(f"🗄️ Archiving {len(emails)} emails...")
         
         try:
+            logger.info(f"Archiving cluster {cluster_id} with {len(emails)} emails")
             # Remove INBOX label and add ARCHIVE label
             for email in emails:
                 self.service.users().messages().modify(
@@ -250,63 +295,114 @@ class InboxTriageAssistant:
                     }
                 ).execute()
             
-            print(f"✅ Successfully archived {len(emails)} emails!")
-            
             # Remove from local clusters
             del self.clusters[cluster_id]
+            if cluster_id in self.cluster_names:
+                del self.cluster_names[cluster_id]
+            
+            logger.info(f"Successfully archived cluster {cluster_id}")
+            return True
             
         except HttpError as error:
-            print(f"❌ Error archiving emails: {error}")
-    
-    def run(self):
-        """Main application loop"""
-        print("🚀 Starting Inbox Triage Assistant...")
+            logger.error(f"HTTP error while archiving cluster: {error}")
+            return False
+
+# Global assistant instance
+assistant = InboxTriageAssistant()
+
+@app.route('/')
+def index():
+    """Main dashboard page"""
+    return render_template('index.html')
+
+@app.route('/load_emails')
+def load_emails():
+    """Load and cluster emails"""
+    try:
+        logger.info("Starting email loading process")
         
         # Authenticate
-        if not self.authenticate():
-            return
+        if not assistant.authenticate():
+            logger.error("Authentication failed")
+            return jsonify({'error': 'Authentication failed. Please check your credentials and try again.'}), 401
         
         # Fetch emails
-        self.fetch_emails()
-        
-        if not self.emails:
-            print("No emails found. Exiting.")
-            return
+        if not assistant.fetch_emails():
+            logger.error("Failed to fetch emails")
+            return jsonify({'error': 'Failed to fetch emails from Gmail. Please check your inbox and try again.'}), 500
         
         # Cluster emails
-        self.cluster_emails()
+        if not assistant.cluster_emails():
+            logger.error("Failed to cluster emails")
+            return jsonify({'error': 'Failed to cluster emails. Please try again.'}), 500
         
-        # Main interaction loop
-        while True:
-            self.display_clusters()
+        # Prepare data for frontend
+        clusters_data = []
+        for cluster_id, emails in assistant.clusters.items():
+            cluster_name = assistant.cluster_names.get(cluster_id, f"Cluster {cluster_id}")
             
-            if not self.clusters:
-                print("All emails have been processed!")
-                break
+            # Format emails for display
+            emails_data = []
+            for email in emails[:5]:  # Show first 5 emails
+                emails_data.append({
+                    'subject': email['subject'][:60] + '...' if len(email['subject']) > 60 else email['subject'],
+                    'sender': email['sender'],
+                    'date': email['date'][:16] if email['date'] else 'Unknown date'
+                })
             
-            print("\nOptions:")
-            print("  Enter cluster number to archive (e.g., 0, 1, 2...)")
-            print("  Enter 'q' to quit")
-            print("  Enter 'r' to refresh")
-            
-            choice = input("\nYour choice: ").strip().lower()
-            
-            if choice == 'q':
-                print("👋 Goodbye!")
-                break
-            elif choice == 'r':
-                print("🔄 Refreshing...")
-                self.fetch_emails()
-                self.cluster_emails()
-            elif choice.isdigit():
-                cluster_id = int(choice)
-                if cluster_id in self.clusters:
-                    self.archive_cluster(cluster_id)
-                else:
-                    print("❌ Invalid cluster number")
-            else:
-                print("❌ Invalid choice")
+            clusters_data.append({
+                'id': int(cluster_id),  # Convert numpy.int32 to regular int
+                'name': cluster_name,
+                'email_count': int(len(emails)),  # Convert numpy.int32 to regular int
+                'emails': emails_data
+            })
+        
+        logger.info(f"Successfully prepared data: {len(assistant.emails)} emails, {len(clusters_data)} clusters")
+        
+        return jsonify({
+            'success': True,
+            'total_emails': int(len(assistant.emails)),  # Convert numpy.int32 to regular int
+            'clusters': clusters_data
+        })
+        
+    except Exception as e:
+        logger.error(f"Unexpected error in load_emails: {e}")
+        return jsonify({'error': f'An unexpected error occurred: {str(e)}'}), 500
 
-if __name__ == "__main__":
-    assistant = InboxTriageAssistant()
-    assistant.run()
+@app.route('/archive_cluster/<int:cluster_id>')
+def archive_cluster(cluster_id):
+    """Archive a specific cluster"""
+    try:
+        # Convert to int to handle any numpy types
+        cluster_id = int(cluster_id)
+        if assistant.archive_cluster(cluster_id):
+            return jsonify({'success': True, 'message': f'Cluster {cluster_id} archived successfully'})
+        else:
+            return jsonify({'error': 'Failed to archive cluster'}), 500
+    except Exception as e:
+        logger.error(f"Error archiving cluster {cluster_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/refresh')
+def refresh():
+    """Refresh emails and clusters"""
+    try:
+        # Clear existing data
+        assistant.emails = []
+        assistant.clusters = {}
+        assistant.cluster_names = {}
+        
+        return jsonify({'success': True, 'message': 'Ready to load emails'})
+    except Exception as e:
+        logger.error(f"Error refreshing: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/health')
+def health():
+    """Health check endpoint for cloud deployment"""
+    return jsonify({'status': 'healthy', 'message': 'Inbox Triage Assistant is running'})
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    debug = os.environ.get('FLASK_ENV') == 'development'
+    app.run(debug=debug, host='0.0.0.0', port=port)
