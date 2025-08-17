@@ -8,6 +8,7 @@ import os
 import pickle
 import base64
 import re
+import json
 from typing import List, Dict, Tuple
 from collections import defaultdict
 from datetime import datetime
@@ -50,6 +51,13 @@ class InboxTriageAssistant:
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
             else:
+                # Try to get credentials from environment variable (Railway)
+                google_creds = os.environ.get('GOOGLE_CREDENTIALS')
+                if google_creds:
+                    # Create credentials.json from environment variable
+                    with open('credentials.json', 'w') as f:
+                        f.write(google_creds)
+                
                 if not os.path.exists('credentials.json'):
                     return False
                 
