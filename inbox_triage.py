@@ -31,38 +31,28 @@ class InboxTriageAssistant:
         self.clusters = {}
         
     def authenticate(self):
-        """Authenticate with Gmail API"""
-        creds = None
-        
-        # Load existing token
-        if os.path.exists('token.pickle'):
-            with open('token.pickle', 'rb') as token:
-                creds = pickle.load(token)
-        
-        # If no valid credentials, get new ones
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                if not os.path.exists('credentials.json'):
-                    print("❌ credentials.json not found!")
-                    print("Please download your OAuth 2.0 credentials from Google Cloud Console")
-                    print("and save them as 'credentials.json' in this folder.")
-                    return False
-                
-                flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-                creds = flow.run_local_server(port=0)
-            
-            # Save credentials for next run
-            with open('token.pickle', 'wb') as token:
-                pickle.dump(creds, token)
-        
+        """Authenticate with Gmail API using service account only"""
         try:
-            self.service = build('gmail', 'v1', credentials=creds)
-            print("✅ Gmail API authenticated successfully!")
-            return True
+            # Try to get service account credentials from environment
+            service_account_info = os.environ.get('GOOGLE_SERVICE_ACCOUNT')
+            
+            if service_account_info:
+                print("Using service account authentication")
+                # Parse the service account JSON from environment variable
+                service_account_dict = json.loads(service_account_info)
+                creds = service_account.Credentials.from_service_account_info(
+                    service_account_dict, scopes=SCOPES
+                )
+                self.service = build('gmail', 'v1', credentials=creds)
+                print("Gmail service built successfully with service account")
+                return True
+            else:
+                print("No service account credentials found in GOOGLE_SERVICE_ACCOUNT environment variable")
+                print("Please set GOOGLE_SERVICE_ACCOUNT environment variable with your service account JSON")
+                return False
+                
         except Exception as e:
-            print(f"❌ Authentication failed: {e}")
+            print(f"Authentication failed: {str(e)}")
             return False
     
     def fetch_emails(self, max_emails=200):
